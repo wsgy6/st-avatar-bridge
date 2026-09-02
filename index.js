@@ -1,70 +1,157 @@
-// SillyTavern → AVATAR 桥接扩展（方案A：流式逐句驱动）
-// 累积流式文本 → 用状态机剥离 HTML 注释/草稿 → 按完整句发桥接（Qwen3 分析）
-// 兼容性：零模块 import，全局 SillyTavern.getContext()
+// SillyTavern → AVATAR 桥接扩展（方案A：流式逐句驱动，v3 加固版）
+// 目标：云酒馆角色回复【流式逐字】输出时，让桌面 AVATAR 实时跟动作。
+//
+// 本版修复实测暴露的三类问题：
+//   1) 同一句被刷几十次（日志里「你是穿越者啊。」刷屏）
+//      → 前缀差分去重 + 整句指纹去重，增量式/累积式 token 都各只发一次。
+//   2) HTML 注释草稿(<!-- 模拟段落/草稿优化:… -->)泄漏进正文
+//      → 对“已累积的整段原文”做一次正则剥离，天然免疫 <!--/--> 被切碎跨 token。
+//   3) “后面的剧情没分析到”
+//      → 结尾 GENERATION_ENDED 用 ctx.chat 完成的整条消息全量对账(sentSig 去重)。
+//
+// 剥离策略说明（为什么不用逐步状态机）：
+//   `<!--` / `-->` 可能被切成 `<`、`!`、`-`… 逐个到达，若按 chunk 增量判会漏/卡死。
+//   改为：累积原始文本 rawAcc → 每次 ingest 全量算一次可见文本 → 与上次比对，
+//   只把“新出现的完整句”发出去。消息也就 ~2KB，全量重算代价可忽略。
+//
+// 兼容：零 import，全局 SillyTavern.getContext()
 
 const BRIDGE_URL = "http://127.0.0.1:8799/analyze";
-let textBuf = "";          // 已剥离注释的可见正文缓冲
-let inComment = false;     // 是否在 HTML 注释内
+
+let rawAcc = "";       // 本次生成累积的原始文本（含注释）
+let rawLast = "";      // 最近一次收到的原始文本（前缀差分去重用）
+let visLen = 0;        // 已消费的可见文本长度（只发其后的新句子）
 let genActive = false;
 let busy = false;
-const SENT_END = /[。！？!?\n…]/;
+let dbgCount = 0;      // 打印前几个 token 形态，便于核对事件载荷
 
-function getCtx() {
-    const root = window.SillyTavern || window.sillytavern;
-    return root && typeof root.getContext === "function" ? root.getContext() : null;
+const SENT_END = /[。！？!?\n…]/;
+const JUNK_ONLY = /^[\s#*·\-—…。，、；：“”「」『』（）()!?！？：:,.。\s]*$/;
+
+// ---- 取 token 文本（兼容 string / {text} / {delta:{content}} / {content}）----
+function tokText(tok) {
+    if (typeof tok === "string") return tok;
+    if (tok == null) return "";
+    return String(tok.text ?? tok.delta?.content ?? tok.content ?? "");
 }
+
+// ---- 对“整段累积原文”剥离 HTML 注释，返回纯可见文本 ----
+// 若末尾有尚未闭合的 <!--，其后内容暂不视为可见（等闭合后下一次会纠正）。
+function stripCommentsFull(raw) {
+    let s = raw.replace(/<!--[\s\S]*?-->/g, "");
+    const lastOpen = s.lastIndexOf("<!--");
+    if (lastOpen >= 0) s = s.slice(0, lastOpen);   // 剥掉残留未闭合注释
+    return s;
+}
+
+// ---- 主入口：把新增 token 并入，剥注释，只发“新出现的完整句” ----
+function ingestRaw(raw) {
+    const s = String(raw ?? "");
+    if (dbgCount < 4) {
+        console.log("[AVATAR-Bridge][dbg] tok:", typeof raw, JSON.stringify(s.slice(0, 60)));
+        dbgCount++;
+    }
+    if (!s) return;
+    // 前缀差分去重：累积式只取新尾巴；增量式原样追加
+    if (rawLast !== "" && s.length > rawLast.length && s.startsWith(rawLast)) {
+        rawAcc += s.slice(rawLast.length);
+    } else if (rawLast === "" || !s.startsWith(rawLast)) {
+        rawAcc += s;
+    }
+    rawLast = s;
+    drainNewSentences();
+}
+
+// ---- 把可见文本里“新出现的完整句”收进 outbox，交给 pump 按节拍发送 ----
+// visLen 只前移“已收进 outbox”的句子，不因 busy 丢句。
+function drainNewSentences() {
+    if (!genActive) return;
+    const vis = stripCommentsFull(rawAcc);
+    if (vis.length <= visLen) return;
+    let from = visLen;
+    for (let i = from; i < vis.length; i++) {
+        if (SENT_END.test(vis[i])) {
+            const sent = vis.slice(from, i + 1);
+            from = i + 1;
+            enqueueSentence(sent);
+        }
+    }
+    visLen = from;            // 全部已入 outbox，安全前移
+    pump();
+}
+
+let outbox = "";             // 待发句子（Qwen 忙时累积，空闲时合并成一次发送）
+const sentSig = new Set();   // 已入队的句子指纹，防重复
+
+// ---- 一句话是否值得分析（滤掉标题/纯标点/太短/正文壳）----
+function isMeaningful(s) {
+    const c = (s || "").trim();
+    if (!c) return false;
+    if (c.length < 4) return false;
+    if (JUNK_ONLY.test(c)) return false;
+    const core = c.replace(/^#{1,6}\s*/, "").trim();
+    if (!core) return false;
+    if (/^(正文|草稿|模拟段落|草稿优化|内容|场景)[：:\s]*$/.test(core)) return false;
+    if (!/[\u4e00-\u9fa5a-zA-Z]/.test(core)) return false;
+    return true;
+}
+
+function enqueueSentence(s) {
+    const c = (s || "").trim();
+    if (!isMeaningful(c)) return;
+    const clean = c.replace(/\s+/g, " ");
+    if (sentSig.has(clean)) return;     // 整句去重（reconcile 重扫不会重发）
+    sentSig.add(clean);
+    outbox += clean + "\n";             // 换行作自然分隔，Qwen 也读得懂连续剧情
+}
+
+// ---- 发送泵：每空闲一次只发一批（忙时合并多句→更省、上下文更全）。
+//      单批限制 MAX_BATCH 字，超出按“整句”拆批，避免一次喂太多让 Qwen 400。
+const MAX_BATCH = 300;
+
+function pump() {
+    if (busy) return;
+    if (!outbox.trim()) return;
+    const lines = outbox.split("\n").filter(x => x.trim());
+    outbox = "";
+    // 取尽量多、但累计 ≤ MAX_BATCH 的整句作为本批
+    let batch = "";
+    const rest = [];
+    for (const ln of lines) {
+        if (!batch) { batch = ln; continue; }
+        if ((batch.length + ln.length + 1) <= MAX_BATCH) { batch += "\n" + ln; continue; }
+        rest.push(ln);                       // 太长，留给下一批
+    }
+    if (rest.length) outbox = rest.join("\n");
+    busy = true;
+    console.log("[AVATAR-Bridge] 分析:", batch.replace(/\n/g, " ").slice(0, 80));
+    post({ message: batch }).then(() => { busy = false; pump(); })
+        .catch(() => { busy = false; pump(); });
+}
+
 function post(payload) {
     return fetch(BRIDGE_URL, { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload) }).then(r => r.json()).catch(() => ({ results: [] }));
 }
 
-// 把流入的字符追加到缓冲（剥离 HTML 注释）。返回是否新增了可见正文。
-function pushChars(chunk) {
-    if (!chunk) return;
-    let i = 0;
-    while (i < chunk.length) {
-        if (inComment) {
-            const close = chunk.indexOf("-->", i);
-            if (close === -1) { return; }        // 注释未闭合，丢弃剩余
-            inComment = false;
-            i = close + 3;
-            // 注释后可能紧跟正文或换行，自然继续
-        } else {
-            const open = chunk.indexOf("<!--", i);
-            if (open === -1) { textBuf += chunk.slice(i); return; }
-            textBuf += chunk.slice(i, open);
-            inComment = true;
-            i = open + 4;
+// ---- 收尾对账：把整条可见文本切成句入队（指纹去重保证不重发）----
+function reconcileAll(visibleText) {
+    if (!visibleText) return;
+    let from = 0;
+    for (let i = 0; i < visibleText.length; i++) {
+        if (SENT_END.test(visibleText[i])) {
+            enqueueSentence(visibleText.slice(from, i + 1));
+            from = i + 1;
         }
     }
+    const tail = visibleText.slice(from).trim();
+    if (tail) enqueueSentence(tail);
+    pump();
 }
 
-function analyzeSentence(s) {
-    if (busy) return;
-    const clean = s.trim();
-    if (clean.length < 6) return;
-    // 过滤纯标点/无意义
-    if (!/[\u4e00-\u9fa5a-zA-Z]/.test(clean)) return;
-    busy = true;
-    console.log("[AVATAR-Bridge] 分析:", clean.replace(/\s+/g, " ").slice(0, 40));
-    post({ message: clean }).then(res => {
-        if (res?.results?.length) console.log("[AVATAR-Bridge] →", JSON.stringify(res.results));
-        busy = false;
-    }).catch(() => { busy = false; });
-}
-
-// 从缓冲尾部提取一个完整句子并触发分析
-function emitCompleteSentence() {
-    if (!genActive || busy) return;
-    // 找缓冲里第一个句子结束符
-    let cut = -1;
-    for (let i = 0; i < textBuf.length; i++) {
-        if (SENT_END.test(textBuf[i])) { cut = i + 1; break; }
-    }
-    if (cut < 0) return;                 // 无完整句
-    const sent = textBuf.slice(0, cut);
-    textBuf = textBuf.slice(cut);
-    analyzeSentence(sent);
+function getCtx() {
+    const root = window.SillyTavern || window.sillytavern;
+    return root && typeof root.getContext === "function" ? root.getContext() : null;
 }
 
 function setup() {
@@ -74,13 +161,20 @@ function setup() {
     const evt = ctx.eventSource;
     if (!evt || !evt.on) { console.error("[AVATAR-Bridge] 无 eventSource"); return; }
 
-    const startGen = () => { genActive = true; textBuf = ""; inComment = false; };
+    const startGen = () => { genActive = true; rawAcc = ""; rawLast = ""; visLen = 0; outbox = ""; busy = false; };
     const endGen = () => {
         genActive = false;
-        // 尾部残余正文（未到句号也被截断）——分析最后一段，但避免重复
-        if (textBuf.trim().length >= 10) analyzeSentence(textBuf.trim());
-        textBuf = ""; inComment = false;
+        // 兜底1：把残余未消费可见文本（含无句号的末句）整体补发
+        const vis = stripCommentsFull(rawAcc);
+        if (vis.slice(visLen).trim()) reconcileAll(vis.slice(visLen));
+        // 兜底2：用 ctx.chat 已完成消息做全量对账，保证后半段不漏
+        const arr = ctx.chat || [];
+        const last = arr[arr.length - 1];
+        const rawMsg = last ? (last.mes ?? last.message ?? "") : "";
+        if (rawMsg) reconcileAll(stripCommentsFull(rawMsg));
+        rawAcc = ""; rawLast = ""; visLen = 0; outbox = ""; busy = false;
     };
+
     if (et.GENERATION_STARTED) evt.on(et.GENERATION_STARTED, startGen);
     if (et.GENERATION_ENDED) evt.on(et.GENERATION_ENDED, endGen);
     if (et.GENERATION_STOPPED) evt.on(et.GENERATION_STOPPED, endGen);
@@ -89,24 +183,18 @@ function setup() {
     if (tokenEvt) {
         evt.on(tokenEvt, (tok) => {
             if (!genActive) genActive = true;
-            let t = "";
-            if (typeof tok === "string") t = tok;
-            else if (tok) t = tok?.text ?? tok?.delta?.content ?? tok?.content ?? "";
-            if (t) { pushChars(t); emitCompleteSentence(); }
+            const t = tokText(tok);
+            if (t) ingestRaw(t);
         });
-        console.log("[AVATAR-Bridge] 已监听流式 token（HTML注释过滤）");
+        console.log("[AVATAR-Bridge] 已监听流式 token（v3 整段剥注释+去重+兜底对账）");
     } else {
         console.log("[AVATAR-Bridge] 无流式事件 → 消息完成模式");
         const recv = et.MESSAGE_RECEIVED;
-        if (recv) evt.on(recv, (id) => {
-            try {
-                const msg = ctx.chat?.[id];
-                if (!msg || msg.is_user || msg.is_system) return;
-                let raw = msg.mes ?? msg.message ?? "";
-                // 剥离注释后分析末尾
-                let tmp = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
-                if (tmp.length >= 10) post({ message: tmp.slice(-300) });
-            } catch (e) { /* ignore */ }
+        if (recv) evt.on(recv, () => {
+            const arr = ctx.chat || [];
+            const last = arr[arr.length - 1];
+            const rawMsg = last ? (last.mes ?? last.message ?? "") : "";
+            if (rawMsg) reconcileAll(stripCommentsFull(rawMsg));
         });
     }
 
