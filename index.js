@@ -44,7 +44,7 @@ function analyzeSentence(s) {
     const clean = s.trim();
     if (clean.length < 6) return;
     // 过滤纯标点/无意义
-    if (!/[一-龥a-zA-Z]/.test(clean)) return;
+    if (!/[\u4e00-\u9fa5a-zA-Z]/.test(clean)) return;
     busy = true;
     console.log("[AVATAR-Bridge] 分析:", clean.replace(/\s+/g, " ").slice(0, 40));
     post({ message: clean }).then(res => {
