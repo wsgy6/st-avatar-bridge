@@ -14,9 +14,17 @@
 //   改为：累积原始文本 rawAcc → 每次 ingest 全量算一次可见文本 → 与上次比对，
 //   只把“新出现的完整句”发出去。消息也就 ~2KB，全量重算代价可忽略。
 //
+// v3.1：除 HTML 注释外，还整块剥除“非剧情结构标签” `<parallel_world>…</parallel_world>`
+//   （角色卡/模型用它放平行世界群消息、状态设定，不是当前剧情的动作/台词，
+//    不喂给 Qwen，避免浪费分析 + 误触发无关动作）。可扩充 STRIP_BLOCK_TAGS。
+//   整段正则 → 天然免疫 <tag 或 </tag> 被切碎跨 token。
+//
 // 兼容：零 import，全局 SillyTavern.getContext()
 
 const BRIDGE_URL = "http://127.0.0.1:8799/analyze";
+
+// 要整块从可见正文里剥掉的“成对非剧情标签”（<tag>…</tag>），小写匹配。
+const STRIP_BLOCK_TAGS = ["parallel_world"];
 
 let rawAcc = "";       // 本次生成累积的原始文本（含注释）
 let rawLast = "";      // 最近一次收到的原始文本（前缀差分去重用）
@@ -35,12 +43,22 @@ function tokText(tok) {
     return String(tok.text ?? tok.delta?.content ?? tok.content ?? "");
 }
 
-// ---- 对“整段累积原文”剥离 HTML 注释，返回纯可见文本 ----
-// 若末尾有尚未闭合的 <!--，其后内容暂不视为可见（等闭合后下一次会纠正）。
+// ---- 对“整段累积原文”剥离 HTML 注释 + 非剧情结构标签，返回纯可见文本 ----
+// ① HTML 注释 <!--…-->：若末尾有尚未闭合的 <!--，其后内容暂不视为可见（等闭合后下一次纠正）。
+// ② 成对结构标签 <parallel_world>…</parallel_world> 等（STRIP_BLOCK_TAGS）：
+//    整块剥除；若末尾有已开未闭的 <tag，则其后内容先不视为可见（闭合后下次纠正）。
+// ③ 顺序：先剥注释（可能把 `<tag` 夹在注释里的情况先清掉），再剥结构标签。
 function stripCommentsFull(raw) {
-    let s = raw.replace(/<!--[\s\S]*?-->/g, "");
+    let s = String(raw ?? "").replace(/<!--[\s\S]*?-->/g, "");
     const lastOpen = s.lastIndexOf("<!--");
     if (lastOpen >= 0) s = s.slice(0, lastOpen);   // 剥掉残留未闭合注释
+    for (const t of STRIP_BLOCK_TAGS) {
+        // 剥整块 <parallel_world>…</parallel_world>（含未闭合即视为到块尾的情形由下行兜底）
+        s = s.replace(new RegExp("<" + t + "[\\s\\S]*?</" + t + ">", "gi"), "");
+        // 剥“标签已开、闭合还没到”的残留尾部（下次闭合后会自动补剥）
+        const lo = s.toLowerCase().lastIndexOf("<" + t.toLowerCase());
+        if (lo >= 0) s = s.slice(0, lo);
+    }
     return s;
 }
 
