@@ -1,39 +1,41 @@
 // SillyTavern → AVATAR 桥接扩展
 // 作用：角色每条回复渲染后，把全文 + 情绪标签 POST 给本机桥接服务 (127.0.0.1:8799)
-// 采用官方推荐的 getContext() 模式，从标准入口导入，兼容主流版本
-
-// eventSource / event_types 来自 script.js（全局事件系统）
-import { eventSource, event_types } from "../../../script.js";
-// getContext() 来自 extensions.js（官方导出的上下文入口）
-import { getContext } from "../../../extensions.js";
+//
+// 兼容性说明：完全不使用模块 import（不同 ST 版本 script.js/extensions.js 导出不同，
+// 魔改版/托管版更容易崩）。改用官方全局对象 SillyTavern.getContext()，任何版本通用。
+// 参考：https://docs.sillytavern.app/for-contributors/writing-extensions
 
 const BRIDGE_URL = "http://127.0.0.1:8799/event";
-let lastHash = ""; // 防重复推送
+let lastHash = "";   // 防重复推送
+let ready = false;
 
-function getMessage(index) {
-    try {
-        const context = getContext();
-        return (context.chat || [])[index];
-    } catch (e) {
-        console.debug("[AVATAR-Bridge] getContext 失败:", e.message ?? e);
-        return null;
-    }
+function getCtx() {
+    // 标准版与部分 MOD 都暴露全局 SillyTavern；兜底读 window
+    const root = window.SillyTavern || window.sillytavern;
+    return root && typeof root.getContext === "function" ? root.getContext() : null;
+}
+
+function currentEventTypes(ctx) {
+    // eventTypes 可能在 ctx.eventTypes 或 ctx.event_types（版本差异）
+    return ctx.eventTypes || ctx.event_types || {};
 }
 
 async function pushToBridge(messageId) {
     try {
-        const msg = getMessage(messageId);
+        const ctx = getCtx();
+        if (!ctx || !ctx.chat) return;
+        const msg = ctx.chat[messageId];
         if (!msg || msg.is_user || msg.is_system) return;
 
         const text = msg.mes ?? msg.message ?? "";
         if (!text.trim()) return;
 
-        // 防重复：同一消息可能触发多次事件
+        // 防重复
         const hash = messageId + ":" + text.length + ":" + text.slice(-16);
         if (lastHash === hash) return;
         lastHash = hash;
 
-        // 情绪：SillyTavern 的 classify 扩展会把情绪写进 msg.extra
+        // 情绪标签（若有 classify/Character Expressions 扩展写入）
         const emotion = msg.extra?.emotion ?? "";
 
         const resp = await fetch(BRIDGE_URL, {
@@ -50,17 +52,36 @@ async function pushToBridge(messageId) {
             }
         }
     } catch (err) {
-        // 桥接服务没开时不刷屏，只在控制台留一句
-        console.debug("[AVATAR-Bridge] 无法连接桥接服务:", err.message ?? err);
+        console.debug("[AVATAR-Bridge] 推送失败:", err.message ?? err);
     }
 }
 
-// 角色消息生成完成（非流式主通道）
-eventSource.on(event_types.MESSAGE_RECEIVED, (messageId) => pushToBridge(messageId));
-// 渲染完成（流式输出结束后也会触发）
-eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => pushToBridge(messageId));
+function setup() {
+    const ctx = getCtx();
+    if (!ctx) {
+        // 全局对象还没就绪，稍后重试
+        setTimeout(setup, 1000);
+        return;
+    }
+    const et = currentEventTypes(ctx);
+    const evt = ctx.eventSource;
+    if (!evt || !evt.on) {
+        console.error("[AVATAR-Bridge] 未找到 eventSource，扩展无法监听。你的 SillyTavern 版本可能不兼容");
+        return;
+    }
+    evt.on(et.MESSAGE_RECEIVED, (id) => pushToBridge(id));
+    evt.on(et.CHARACTER_MESSAGE_RENDERED, (id) => pushToBridge(id));
+    ready = true;
+    console.log("[AVATAR-Bridge] 扩展已加载并监听消息事件 →", BRIDGE_URL);
+}
 
-console.log("[AVATAR-Bridge] 扩展已加载 → http://127.0.0.1:8799/event");
+// 页面加载后注册；若窗口已就绪事件仍可能未绑定，延迟一次确保
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => setTimeout(setup, 500));
+} else {
+    setTimeout(setup, 500);
+}
+
 console.log("[AVATAR-Bridge] 页面来源:", window.location.origin);
 
 // 桥接可达性自检
