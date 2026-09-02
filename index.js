@@ -1,127 +1,122 @@
 // SillyTavern → AVATAR 桥接扩展（方案A：流式逐句驱动）
-// 作用：角色流式生成时，按句切分已生成的文本，句子完整即 POST 给本地桥接
-//       （桥接负责调 Qwen3 分析动作+情绪，映射成 AVATAR 动画）
-// 兼容性：零模块 import，用全局 SillyTavern.getContext()，穿透魔改/托管版
+// 累积流式文本 → 用状态机剥离 HTML 注释/草稿 → 按完整句发桥接（Qwen3 分析）
+// 兼容性：零模块 import，全局 SillyTavern.getContext()
 
 const BRIDGE_URL = "http://127.0.0.1:8799/analyze";
-let streamBuffer = "";      // 当前流式累积的文本
-let analysisLock = false;   // 防止分析重入
-let lastAnalyzedLen = 0;    // 已分析过的字符位置
-let genActive = false;      // 是否正在生成
-let lastMsg = "";           // 兜底防重复
-
-// 句子结束符：中英文句号/叹号/问号/换行/引号组合
+let textBuf = "";          // 已剥离注释的可见正文缓冲
+let inComment = false;     // 是否在 HTML 注释内
+let genActive = false;
+let busy = false;
 const SENT_END = /[。！？!?\n…]/;
 
 function getCtx() {
     const root = window.SillyTavern || window.sillytavern;
     return root && typeof root.getContext === "function" ? root.getContext() : null;
 }
-
-function postToBridge(payload) {
-    return fetch(BRIDGE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-    }).then(r => r.json()).catch(e => {
-        console.log("[AVATAR-Bridge] 桥接请求失败:", e.message ?? e);
-        return { results: [] };
-    });
+function post(payload) {
+    return fetch(BRIDGE_URL, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload) }).then(r => r.json()).catch(() => ({ results: [] }));
 }
 
-// 分析新完成的句子（从流式缓冲里切出还没分析过的完整句）
-function analyzeNewComplete() {
-    if (analysisLock || !genActive) return;
-    if (streamBuffer.length - lastAnalyzedLen < 8) return; // 太短没意义
-
-    // 从上次分析位置往后找完整句子
-    const pending = streamBuffer.slice(lastAnalyzedLen);
-    let cut = -1;
-    for (let i = 0; i < pending.length; i++) {
-        if (SENT_END.test(pending[i])) { cut = i + 1; break; }
+// 把流入的字符追加到缓冲（剥离 HTML 注释）。返回是否新增了可见正文。
+function pushChars(chunk) {
+    if (!chunk) return;
+    let i = 0;
+    while (i < chunk.length) {
+        if (inComment) {
+            const close = chunk.indexOf("-->", i);
+            if (close === -1) { return; }        // 注释未闭合，丢弃剩余
+            inComment = false;
+            i = close + 3;
+            // 注释后可能紧跟正文或换行，自然继续
+        } else {
+            const open = chunk.indexOf("<!--", i);
+            if (open === -1) { textBuf += chunk.slice(i); return; }
+            textBuf += chunk.slice(i, open);
+            inComment = true;
+            i = open + 4;
+        }
     }
-    if (cut < 0) return; // 还没到完整句子
+}
 
-    const sentence = pending.slice(0, cut).trim();
-    if (!sentence) { lastAnalyzedLen += cut; return; }
+function analyzeSentence(s) {
+    if (busy) return;
+    const clean = s.trim();
+    if (clean.length < 6) return;
+    // 过滤纯标点/无意义
+    if (!/[一-龥a-zA-Z]/.test(clean)) return;
+    busy = true;
+    console.log("[AVATAR-Bridge] 分析:", clean.replace(/\s+/g, " ").slice(0, 40));
+    post({ message: clean }).then(res => {
+        if (res?.results?.length) console.log("[AVATAR-Bridge] →", JSON.stringify(res.results));
+        busy = false;
+    }).catch(() => { busy = false; });
+}
 
-    analysisLock = true;
-    lastAnalyzedLen += cut;
-    console.log("[AVATAR-Bridge] 分析句子 →", sentence.slice(0, 40).replace(/\s+/g, " "));
-    postToBridge({ message: sentence, stream: true }).then(res => {
-        if (res?.results?.length) console.log("[AVATAR-Bridge] 已派发:", JSON.stringify(res.results));
-        analysisLock = false;
-    });
+// 从缓冲尾部提取一个完整句子并触发分析
+function emitCompleteSentence() {
+    if (!genActive || busy) return;
+    // 找缓冲里第一个句子结束符
+    let cut = -1;
+    for (let i = 0; i < textBuf.length; i++) {
+        if (SENT_END.test(textBuf[i])) { cut = i + 1; break; }
+    }
+    if (cut < 0) return;                 // 无完整句
+    const sent = textBuf.slice(0, cut);
+    textBuf = textBuf.slice(cut);
+    analyzeSentence(sent);
 }
 
 function setup() {
     const ctx = getCtx();
-    if (!ctx) {
-        setTimeout(setup, 1000);
-        return;
-    }
+    if (!ctx) { setTimeout(setup, 800); return; }
     const et = ctx.eventTypes || ctx.event_types || {};
     const evt = ctx.eventSource;
-    if (!evt || !evt.on) {
-        console.error("[AVATAR-Bridge] 未找到 eventSource");
-        return;
-    }
+    if (!evt || !evt.on) { console.error("[AVATAR-Bridge] 无 eventSource"); return; }
 
-    // 流式 token 到达 → 累积进缓冲
+    const startGen = () => { genActive = true; textBuf = ""; inComment = false; };
+    const endGen = () => {
+        genActive = false;
+        // 尾部残余正文（未到句号也被截断）——分析最后一段，但避免重复
+        if (textBuf.trim().length >= 10) analyzeSentence(textBuf.trim());
+        textBuf = ""; inComment = false;
+    };
+    if (et.GENERATION_STARTED) evt.on(et.GENERATION_STARTED, startGen);
+    if (et.GENERATION_ENDED) evt.on(et.GENERATION_ENDED, endGen);
+    if (et.GENERATION_STOPPED) evt.on(et.GENERATION_STOPPED, endGen);
+
     const tokenEvt = et.STREAM_TOKEN_RECEIVED;
     if (tokenEvt) {
-        evt.on(tokenEvt, (token) => {
-            if (typeof token === "string") streamBuffer += token;
-            else if (token && typeof token === "object") {
-                const c = token?.text ?? token?.delta?.content ?? "";
-                if (c) streamBuffer += c;
-            }
-            analyzeNewComplete();
+        evt.on(tokenEvt, (tok) => {
+            if (!genActive) genActive = true;
+            let t = "";
+            if (typeof tok === "string") t = tok;
+            else if (tok) t = tok?.text ?? tok?.delta?.content ?? tok?.content ?? "";
+            if (t) { pushChars(t); emitCompleteSentence(); }
         });
-        console.log("[AVATAR-Bridge] 已监听流式 token 事件");
+        console.log("[AVATAR-Bridge] 已监听流式 token（HTML注释过滤）");
     } else {
-        console.log("[AVATAR-Bridge] 无 STREAM_TOKEN_RECEIVED 事件，回退消息完成模式");
+        console.log("[AVATAR-Bridge] 无流式事件 → 消息完成模式");
+        const recv = et.MESSAGE_RECEIVED;
+        if (recv) evt.on(recv, (id) => {
+            try {
+                const msg = ctx.chat?.[id];
+                if (!msg || msg.is_user || msg.is_system) return;
+                let raw = msg.mes ?? msg.message ?? "";
+                // 剥离注释后分析末尾
+                let tmp = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
+                if (tmp.length >= 10) post({ message: tmp.slice(-300) });
+            } catch (e) { /* ignore */ }
+        });
     }
 
-    // 生成开始/结束 管理缓冲
-    const gs = et.GENERATION_STARTED, ge = et.GENERATION_ENDED;
-    if (gs) evt.on(gs, () => { genActive = true; });
-    if (ge) evt.on(ge, () => {
-        genActive = false;
-        // 生成结束，把残留缓冲最后分析一次
-        if (streamBuffer.length > lastAnalyzedLen + 8) {
-            const leftover = streamBuffer.slice(lastAnalyzedLen).trim();
-            if (leftover) {
-                postToBridge({ message: leftover, stream: true });
-            }
-        }
-        streamBuffer = ""; lastAnalyzedLen = 0;
-    });
-
-    // 兜底：消息完成也触发（防止流式事件没截全）
-    const recv = et.MESSAGE_RECEIVED;
-    if (recv) evt.on(recv, (id) => {
-        try {
-            const msg = ctx.chat?.[id];
-            if (!msg || msg.is_user || msg.is_system) return;
-            const text = msg.mes ?? msg.message ?? "";
-            if (text && text !== lastMsg) {
-                lastMsg = text;
-                // 消息完成后由桥接整体分析一次（兜底，正常流式已逐句触发）
-            }
-        } catch (e) { /* ignore */ }
-    });
-
-    console.log("[AVATAR-Bridge] 扩展已加载（流式截句模式）→", BRIDGE_URL);
+    console.log("[AVATAR-Bridge] 扩展已加载 →", BRIDGE_URL);
 }
 
 if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => setTimeout(setup, 500));
-} else {
-    setTimeout(setup, 500);
-}
-
-console.log("[AVATAR-Bridge] 页面来源:", window.location.origin);
-fetch("http://127.0.0.1:8799/ping")
-    .then(r => r.json()).then(d => console.log("[AVATAR-Bridge] ✅ 桥接可达:", d))
+} else { setTimeout(setup, 500); }
+console.log("[AVATAR-Bridge] 来源:", window.location.origin);
+fetch("http://127.0.0.1:8799/ping").then(r => r.json())
+    .then(d => console.log("[AVATAR-Bridge] ✅ 桥接可达:", d))
     .catch(e => console.log("[AVATAR-Bridge] ❌ 桥接不可达:", e.message));
