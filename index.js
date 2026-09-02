@@ -14,8 +14,9 @@
 //   改为：累积原始文本 rawAcc → 每次 ingest 全量算一次可见文本 → 与上次比对，
 //   只把“新出现的完整句”发出去。消息也就 ~2KB，全量重算代价可忽略。
 //
-// v3.1：除 HTML 注释外，还整块剥除“非剧情结构标签” `<parallel_world>…</parallel_world>`
-//   （角色卡/模型用它放平行世界群消息、状态设定，不是当前剧情的动作/台词，
+// v3.1：除 HTML 注释外，还整块剥除“非剧情结构标签”
+//   `<parallel_world>…</parallel_world>`、`<UpdateVariable>…</UpdateVariable>` 等
+//   （角色卡/模型用它放平行世界群消息、记忆/状态变量，不是当前剧情动作台词，
 //    不喂给 Qwen，避免浪费分析 + 误触发无关动作）。可扩充 STRIP_BLOCK_TAGS。
 //   整段正则 → 天然免疫 <tag 或 </tag> 被切碎跨 token。
 //
@@ -23,8 +24,13 @@
 
 const BRIDGE_URL = "http://127.0.0.1:8799/analyze";
 
-// 要整块从可见正文里剥掉的“成对非剧情标签”（<tag>…</tag>），小写匹配。
-const STRIP_BLOCK_TAGS = ["parallel_world"];
+// 要整块从可见正文里剥掉的“非剧情结构标签”。按闭合形态分两类，避免误删剧情：
+//   tail   : 成对长块 <tag>…</tag>（值可能很长、通常在消息尾部），剥整块；流式中途
+//            标签已开未闭时，先将其后内容不视为可见（防 parallel_world 内部被当剧情发）。
+//   inline : 自闭合 / 单标签 <tag …/>、<tag …>（如变量注入，无内容体），剥标签自身、
+//            或成对则剥整块；但【不做】“未闭合切尾”——避免把标签后的真剧情误删。
+// 新增同类标签时：确认它是成对长块(tail)还是短标签(inline)再登记。
+const STRIP_BLOCK_TAGS = { parallel_world: "tail", UpdateVariable: "inline" };
 
 let rawAcc = "";       // 本次生成累积的原始文本（含注释）
 let rawLast = "";      // 最近一次收到的原始文本（前缀差分去重用）
@@ -45,19 +51,23 @@ function tokText(tok) {
 
 // ---- 对“整段累积原文”剥离 HTML 注释 + 非剧情结构标签，返回纯可见文本 ----
 // ① HTML 注释 <!--…-->：若末尾有尚未闭合的 <!--，其后内容暂不视为可见（等闭合后下一次纠正）。
-// ② 成对结构标签 <parallel_world>…</parallel_world> 等（STRIP_BLOCK_TAGS）：
-//    整块剥除；若末尾有已开未闭的 <tag，则其后内容先不视为可见（闭合后下次纠正）。
+// ② 非剧情结构标签（STRIP_BLOCK_TAGS）：tail → 剥成对整块；inline → 剥成对整块或自闭合单标签。
 // ③ 顺序：先剥注释（可能把 `<tag` 夹在注释里的情况先清掉），再剥结构标签。
 function stripCommentsFull(raw) {
     let s = String(raw ?? "").replace(/<!--[\s\S]*?-->/g, "");
     const lastOpen = s.lastIndexOf("<!--");
     if (lastOpen >= 0) s = s.slice(0, lastOpen);   // 剥掉残留未闭合注释
-    for (const t of STRIP_BLOCK_TAGS) {
-        // 剥整块 <parallel_world>…</parallel_world>（含未闭合即视为到块尾的情形由下行兜底）
-        s = s.replace(new RegExp("<" + t + "[\\s\\S]*?</" + t + ">", "gi"), "");
-        // 剥“标签已开、闭合还没到”的残留尾部（下次闭合后会自动补剥）
-        const lo = s.toLowerCase().lastIndexOf("<" + t.toLowerCase());
-        if (lo >= 0) s = s.slice(0, lo);
+    for (const [t, mode] of Object.entries(STRIP_BLOCK_TAGS)) {
+        // 1) 若有闭合标签 → 成对整块剥（tail 与 inline 都支持成对形态）
+        s = s.replace(new RegExp("<" + t + "\\b[\\s\\S]*?</" + t + "\\s*>", "gi"), "");
+        if (mode === "tail") {
+            // 2a) tail：成对长块，流式中途标签已开未闭 → 其后内容先不算可见（闭合后下次补剥）
+            const lo = s.toLowerCase().lastIndexOf("<" + t.toLowerCase());
+            if (lo >= 0) s = s.slice(0, lo);
+        } else {
+            // 2b) inline：剥“自闭合/无闭合的单标签”自身，保留 `>` 后的剧情（绝不切尾）
+            s = s.replace(new RegExp("<" + t + "\\b[^>]*/?>", "gi"), "");
+        }
     }
     return s;
 }
