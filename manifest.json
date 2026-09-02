@@ -5,7 +5,7 @@
   "optional": ["classify"],
   "js": "index.js",
   "css": "style.css",
-  "author": "user + workbuddy",
+  "author": "wsgy6",
   "version": "0.1.0",
   "homePage": "https://github.com/wsgy6/st-avatar-bridge"
 }
