@@ -1,0 +1,12 @@
+# 本地私有配置——绝不入库（含你的 AVATAR 总线 token 与真实映射）
+bridge/token.txt
+bridge/mapping.json
+
+# Python 运行残留
+__pycache__/
+*.pyc
+
+# 桥接日志
+*.log
+bridge_run.log
+bridge_err.log
