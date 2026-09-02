@@ -1,0 +1,35 @@
+{
+  "_说明": "示例映射表：复制为 mapping.json 后按自己的 AVATAR 资产修改。动画名/avatar id 需与 AVATAR 里的实际资产一致（可用 AVATAR 的资产列表 API 查看）。改完保存即生效，桥接服务无需重启。",
+  "emotion_to_animation": {
+    "joy": "Greeting",
+    "happy": "Greeting",
+    "love": "Greeting",
+    "excitement": "Spin",
+    "sadness": "Rest",
+    "anger": "Shoot",
+    "surprise": "Peace Sign",
+    "neutral": "Rest"
+  },
+  "chinese_emotion_to_animation": {
+    "开心": "Greeting",
+    "高兴": "Greeting",
+    "喜欢": "Greeting",
+    "兴奋": "Spin",
+    "难过": "Rest",
+    "生气": "Shoot",
+    "害怕": "Squat",
+    "惊讶": "Peace Sign"
+  },
+  "action_keywords_to_animation": {
+    "挥手|招手|打招呼": "Greeting",
+    "转身|旋转": "Spin",
+    "蹲|下蹲": "Squat",
+    "比手势|比心": "Peace Sign",
+    "射击|开枪|指": "Shoot",
+    "发呆|愣住|无语": "Rest"
+  },
+  "outfit_keywords_to_avatar": {
+    "换形象一|avatar1": "avatar1",
+    "换形象二|avatar2": "avatar2"
+  }
+}
